@@ -1,0 +1,290 @@
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Transcribe Proxy 테스트</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 { color: #333; margin-bottom: 30px; }
+        .config-section {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        label { display: block; margin-bottom: 5px; font-weight: 600; color: #555; }
+        input, select {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 15px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        button {
+            padding: 15px 30px;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-right: 10px;
+            margin-bottom: 10px;
+            transition: all 0.2s;
+        }
+        #recordBtn {
+            background: #4CAF50;
+            color: white;
+        }
+        #recordBtn:hover { background: #45a049; }
+        #recordBtn.recording {
+            background: #f44336;
+            animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        #sendBtn {
+            background: #2196F3;
+            color: white;
+        }
+        #sendBtn:hover { background: #1976D2; }
+        #sendBtn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .status {
+            padding: 10px;
+            border-radius: 6px;
+            margin: 15px 0;
+            font-weight: 500;
+        }
+        .status.recording { background: #ffebee; color: #c62828; }
+        .status.processing { background: #e3f2fd; color: #1565c0; }
+        .status.success { background: #e8f5e9; color: #2e7d32; }
+        .status.error { background: #ffebee; color: #c62828; }
+        .result {
+            background: #263238;
+            color: #aed581;
+            padding: 20px;
+            border-radius: 8px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 14px;
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 400px;
+            overflow-y: auto;
+            margin-top: 20px;
+        }
+        audio {
+            width: 100%;
+            margin: 15px 0;
+        }
+        .info {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>🎤 Transcribe Proxy 테스트</h1>
+
+    <div class="config-section">
+        <label>API Endpoint URL</label>
+        <input type="text" id="apiUrl" placeholder="https://xxxxx.execute-api.ap-northeast-2.amazonaws.com/prod/transcribe">
+
+        <label>API Key</label>
+        <input type="password" id="apiKey" placeholder="API Key 입력">
+
+        <label>Language</label>
+        <select id="language">
+            <option value="en-US">English (US)</option>
+            <option value="ko-KR">한국어</option>
+            <option value="ja-JP">日本語</option>
+        </select>
+    </div>
+
+    <button id="recordBtn" onclick="toggleRecording()">🎤 녹음 시작</button>
+    <button id="sendBtn" onclick="sendToAPI()" disabled>📤 API 전송</button>
+
+    <div id="status"></div>
+
+    <audio id="audioPlayer" controls style="display:none;"></audio>
+
+    <div id="result" class="result" style="display:none;"></div>
+</div>
+
+<script>
+    let mediaRecorder;
+    let audioChunks = [];
+    let audioBlob;
+    let isRecording = false;
+
+    async function toggleRecording() {
+        if (!isRecording) {
+            await startRecording();
+        } else {
+            stopRecording();
+        }
+    }
+
+    async function startRecording() {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+            // webm 형식으로 녹음 (Transcribe 지원)
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+            audioChunks = [];
+
+            mediaRecorder.ondataavailable = (e) => {
+                audioChunks.push(e.data);
+            };
+
+            mediaRecorder.onstop = () => {
+                audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                const audioUrl = URL.createObjectURL(audioBlob);
+
+                const audioPlayer = document.getElementById('audioPlayer');
+                audioPlayer.src = audioUrl;
+                audioPlayer.style.display = 'block';
+
+                document.getElementById('sendBtn').disabled = false;
+                setStatus('녹음 완료! API로 전송할 수 있습니다.', 'success');
+            };
+
+            mediaRecorder.start();
+            isRecording = true;
+
+            document.getElementById('recordBtn').textContent = '⏹️ 녹음 중지';
+            document.getElementById('recordBtn').classList.add('recording');
+            setStatus('🔴 녹음 중... 영어로 말씀해주세요', 'recording');
+
+        } catch (err) {
+            setStatus('마이크 접근 오류: ' + err.message, 'error');
+        }
+    }
+
+    function stopRecording() {
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+            mediaRecorder.stop();
+            mediaRecorder.stream.getTracks().forEach(track => track.stop());
+        }
+
+        isRecording = false;
+        document.getElementById('recordBtn').textContent = '🎤 녹음 시작';
+        document.getElementById('recordBtn').classList.remove('recording');
+    }
+
+    async function sendToAPI() {
+        const apiUrl = document.getElementById('apiUrl').value.trim();
+        const apiKey = document.getElementById('apiKey').value.trim();
+        const language = document.getElementById('language').value;
+
+        if (!apiUrl || !apiKey) {
+            setStatus('API URL과 API Key를 입력해주세요!', 'error');
+            return;
+        }
+
+        if (!audioBlob) {
+            setStatus('먼저 음성을 녹음해주세요!', 'error');
+            return;
+        }
+
+        setStatus('🔄 API 호출 중... (최대 90초 소요)', 'processing');
+        document.getElementById('sendBtn').disabled = true;
+
+        try {
+            // Blob → Base64 변환
+            const base64Audio = await blobToBase64(audioBlob);
+
+            const payload = {
+                audio_data: base64Audio,
+                session_id: 'test-' + Date.now(),
+                language_code: language
+            };
+
+            console.log('Request payload:', { ...payload, audio_data: payload.audio_data.substring(0, 50) + '...' });
+
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Api-Key': apiKey
+                },
+                body: JSON.stringify(payload)
+            });
+
+            const data = await response.json();
+
+            document.getElementById('result').style.display = 'block';
+            document.getElementById('result').textContent = JSON.stringify(data, null, 2);
+
+            if (response.ok) {
+                setStatus('✅ 성공! 변환 결과를 확인하세요.', 'success');
+            } else {
+                setStatus('❌ 오류: ' + (data.error || response.status), 'error');
+            }
+
+        } catch (err) {
+            setStatus('❌ 요청 실패: ' + err.message, 'error');
+            document.getElementById('result').style.display = 'block';
+            document.getElementById('result').textContent = 'Error: ' + err.message;
+        }
+
+        document.getElementById('sendBtn').disabled = false;
+    }
+
+    function blobToBase64(blob) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                // data:audio/webm;base64, 부분 제거
+                const base64 = reader.result.split(',')[1];
+                resolve(base64);
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    function setStatus(message, type) {
+        const status = document.getElementById('status');
+        status.textContent = message;
+        status.className = 'status ' + type;
+    }
+
+    // 저장된 설정 불러오기
+    window.onload = () => {
+        const savedUrl = localStorage.getItem('transcribe_api_url');
+        const savedKey = localStorage.getItem('transcribe_api_key');
+        if (savedUrl) document.getElementById('apiUrl').value = savedUrl;
+        if (savedKey) document.getElementById('apiKey').value = savedKey;
+    };
+
+    // 설정 저장
+    document.getElementById('apiUrl').onchange = (e) => {
+        localStorage.setItem('transcribe_api_url', e.target.value);
+    };
+    document.getElementById('apiKey').onchange = (e) => {
+        localStorage.setItem('transcribe_api_key', e.target.value);
+    };
+</script>
+</body>
+</html>

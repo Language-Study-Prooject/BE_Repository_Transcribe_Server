@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Transcribe Proxy
+
+Globals:
+  Function:
+    Timeout: 120
+    Runtime: java21
+    MemorySize: 512
+    Architectures:
+      - x86_64
+
+Resources:
+
+  # ============================================
+  # Lambda 함수
+  # ============================================
+  TranscribeProxyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: TranscribeProxyFunction
+      Handler: com.transcribe.proxy.handler.TranscribeProxyHandler::handleRequest
+      Description: Transcribe Proxy Lambda
+      Environment:
+        Variables:
+          TEMP_BUCKET: !Ref TempBucket
+      Policies:
+        # S3 권한
+        - S3CrudPolicy:
+            BucketName: !Ref TempBucket
+        # Transcribe 권한
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - transcribe:StartTranscriptionJob
+                - transcribe:GetTranscriptionJob
+                - transcribe:DeleteTranscriptionJob
+              Resource: '*'
+      Events:
+        TranscribeApi:
+          Type: Api
+          Properties:
+            Path: /transcribe
+            Method: post
+            RestApiId: !Ref TranscribeApi
+        # OPTIONS 추가 (CORS preflight)
+        TranscribeApiOptions:
+          Type: Api
+          Properties:
+            Path: /transcribe
+            Method: options
+            RestApiId: !Ref TranscribeApi
+
+  # ============================================
+  # API Gateway
+  # ============================================
+  TranscribeApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: transcribe-proxy-api
+      StageName: prod
+      Auth:
+        ApiKeyRequired: true
+      Cors:
+        AllowOrigin: "'*'"
+        AllowMethods: "'POST, OPTIONS'"
+        AllowHeaders: "'Content-Type, X-Api-Key'"
+
+  # ============================================
+  # API Key & Usage Plan
+  # ============================================
+  TranscribeApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: TranscribeApiprodStage
+    Properties:
+      Name: opic-transcribe-api-key
+      Description: API Key for OPIc Transcribe Proxy
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref TranscribeApi
+          StageName: prod
+
+  TranscribeUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: TranscribeApiprodStage
+    Properties:
+      UsagePlanName: opic-transcribe-usage-plan
+      Description: Usage plan for Transcribe Proxy
+      ApiStages:
+        - ApiId: !Ref TranscribeApi
+          Stage: prod
+      Throttle:
+        BurstLimit: 10
+        RateLimit: 5
+      Quota:
+        Limit: 1000
+        Period: MONTH
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref TranscribeApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref TranscribeUsagePlan
+
+  # ============================================
+  # S3 임시 버킷 (24시간 후 자동 삭제)
+  # ============================================
+  TempBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteTempFilesAfter24Hours
+            Status: Enabled
+            ExpirationInDays: 1
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+# ============================================
+# Outputs
+# ============================================
+Outputs:
+  ApiEndpoint:
+    Description: Transcribe Proxy API Endpoint
+    Value: !Sub 'https://${TranscribeApi}.execute-api.${AWS::Region}.amazonaws.com/prod/transcribe'
+    Export:
+      Name: TranscribeProxyEndpoint
+
+  ApiKeyId:
+    Description: API Key ID
+    Value: !Ref TranscribeApiKey
+
+  TempBucketName:
+    Description: Temporary S3 Bucket Name
+    Value: !Ref TempBucket
