@@ -1,0 +1,627 @@
+# GitHub Issue → Jira 동기화
+name: Issue-Jira Sync
+
+on:
+  issues:
+    types: [opened, reopened, edited, closed ]
+
+  workflow_dispatch:
+    inputs:
+      process_all_open_issues:
+        description: '수동 트리거로 기존 이슈 일괄 처리'
+        type: boolean
+        default: true
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  sync-issue-to-jira:
+    if: github.event_name == 'issues' && (github.event.action == 'opened' || github.event.action == 'reopened')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Existing Jira Link
+        id: check-jira
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number
+            });
+            const hasJira = comments.data.some(c => c.body.includes('Jira:'));
+            return hasJira;
+
+      - name: Login to Jira
+        if: steps.check-jira.outputs.result == 'false'
+        uses: atlassian/gajira-login@v3
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+
+      - name: Parse Issue Template
+        if: steps.check-jira.outputs.result == 'false'
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const labels = issue.labels.map(l => l.name);
+            const title = issue.title;
+            const body = issue.body || '';
+            
+            // 라벨 기반 Jira Type 결정
+            let jiraType = 'Task';
+            if (labels.includes('epic')) jiraType = 'Epic';
+            else if (labels.includes('story')) jiraType = 'Story';
+            else if (labels.includes('bug')) jiraType = 'Bug';
+            // task, change-request, spike → Task
+            
+            // 제목 prefix로 백업 판단
+            if (jiraType === 'Task') {
+              if (/^\[EPIC\]/i.test(title)) jiraType = 'Epic';
+              else if (/^\[STORY\]/i.test(title)) jiraType = 'Story';
+              else if (/^\[BUG\]/i.test(title)) jiraType = 'Bug';
+            }
+            
+            // 템플릿 필드 파싱 (### 헤더 기반)
+            const parseSection = (label) => {
+              const regex = new RegExp(`### ${label}\\s*\\n([\\s\\S]*?)(?=###|$)`);
+              const match = body.match(regex);
+              return match ? match[1].trim() : '';
+            };
+            
+            // 공통 + 템플릿별 필드
+            const fields = {
+              // Epic
+              goal: parseSection('목표'),
+              scope: parseSection('범위 / Not-in-scope') || parseSection('작업 범위'),
+              breakdown: parseSection('하위 스토리\\(체크리스트\\)'),
+              milestone: parseSection('마일스톤'),
+              // Story
+              background: parseSection('배경'),
+              ac: parseSection('수용 기준\\(AC\\)'),
+              design: parseSection('디자인/문서 링크') || parseSection('디자인/계약 링크'),
+              notes: parseSection('구현 메모/리스크'),
+              epic: parseSection('연결된 Epic'),
+              // Task
+              parent: parseSection('연결된 Story/Epic'),
+              done: parseSection('Done 기준'),
+              // Change Request
+              related: parseSection('영향받는 Epic/Story/Task'),
+              change: parseSection('제안 변경 사항'),
+              impact: parseSection('영향도'),
+              decision: parseSection('결정/대안/근거\\(ADR 링크\\)'),
+              // Spike
+              timebox: parseSection('타임박스'),
+              questions: parseSection('핵심 질문'),
+              approach: parseSection('접근 방법'),
+              deliverables: parseSection('산출물\\(요약/ADR/POC 링크\\)')
+            };
+            
+            // 템플릿 타입 판단
+            let templateType = 'task';
+            if (labels.includes('epic') || /^\[EPIC\]/i.test(title)) templateType = 'epic';
+            else if (labels.includes('story') || /^\[STORY\]/i.test(title)) templateType = 'story';
+            else if (labels.includes('change-request') || /^\[CR\]/i.test(title)) templateType = 'cr';
+            else if (labels.includes('spike') || /^\[SPIKE\]/i.test(title)) templateType = 'spike';
+            
+            core.setOutput('jira_type', jiraType);
+            core.setOutput('template_type', templateType);
+            core.setOutput('goal', fields.goal);
+            core.setOutput('scope', fields.scope);
+            core.setOutput('breakdown', fields.breakdown);
+            core.setOutput('background', fields.background);
+            core.setOutput('ac', fields.ac);
+            core.setOutput('design', fields.design);
+            core.setOutput('parent', fields.parent);
+            core.setOutput('change', fields.change);
+            core.setOutput('impact', fields.impact);
+            core.setOutput('timebox', fields.timebox);
+            core.setOutput('questions', fields.questions);
+
+      - name: Build Jira Description
+        if: steps.check-jira.outputs.result == 'false'
+        id: description
+        uses: actions/github-script@v7
+        env:
+          TEMPLATE_TYPE: ${{ steps.parse.outputs.template_type }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          FIELD_GOAL: ${{ steps.parse.outputs.goal }}
+          FIELD_SCOPE: ${{ steps.parse.outputs.scope }}
+          FIELD_BREAKDOWN: ${{ steps.parse.outputs.breakdown }}
+          FIELD_BACKGROUND: ${{ steps.parse.outputs.background }}
+          FIELD_AC: ${{ steps.parse.outputs.ac }}
+          FIELD_DESIGN: ${{ steps.parse.outputs.design }}
+          FIELD_PARENT: ${{ steps.parse.outputs.parent }}
+          FIELD_CHANGE: ${{ steps.parse.outputs.change }}
+          FIELD_IMPACT: ${{ steps.parse.outputs.impact }}
+          FIELD_TIMEBOX: ${{ steps.parse.outputs.timebox }}
+          FIELD_QUESTIONS: ${{ steps.parse.outputs.questions }}
+        with:
+          script: |
+            const templateType = process.env.TEMPLATE_TYPE || 'task';
+            const issueUrl = process.env.ISSUE_URL || '';
+            const author = process.env.ISSUE_AUTHOR || '';
+            
+            let desc = 'h3. GitHub Issue\n' + issueUrl + '\n\nh3. Author\n' + author + '\n\n';
+            
+            switch (templateType) {
+              case 'epic':
+                desc += 'h3. 목표\n' + (process.env.FIELD_GOAL || '-') + '\n\n';
+                desc += 'h3. 범위\n' + (process.env.FIELD_SCOPE || '-') + '\n\n';
+                desc += 'h3. 하위 스토리\n' + (process.env.FIELD_BREAKDOWN || '-') + '\n';
+                break;
+              case 'story':
+                desc += 'h3. 배경\n' + (process.env.FIELD_BACKGROUND || '-') + '\n\n';
+                desc += 'h3. 수용 기준(AC)\n' + (process.env.FIELD_AC || '-') + '\n\n';
+                desc += 'h3. 디자인\n' + (process.env.FIELD_DESIGN || '-') + '\n';
+                break;
+              case 'cr':
+                desc += 'h3. 제안 변경 사항\n' + (process.env.FIELD_CHANGE || '-') + '\n\n';
+                desc += 'h3. 영향도\n' + (process.env.FIELD_IMPACT || '-') + '\n';
+                break;
+              case 'spike':
+                desc += 'h3. 타임박스\n' + (process.env.FIELD_TIMEBOX || '-') + '\n\n';
+                desc += 'h3. 핵심 질문\n' + (process.env.FIELD_QUESTIONS || '-') + '\n';
+                break;
+              default:
+                desc += 'h3. 연결된 Story/Epic\n' + (process.env.FIELD_PARENT || '-') + '\n\n';
+                desc += 'h3. 작업 범위\n' + (process.env.FIELD_SCOPE || '-') + '\n';
+            }
+            
+            core.setOutput('content', desc);
+
+      - name: Create Jira Issue
+        if: steps.check-jira.outputs.result == 'false'
+        id: create-jira
+        uses: atlassian/gajira-create@v3
+        with:
+          project: MESP
+          issuetype: ${{ steps.parse.outputs.jira_type }}
+          summary: '[Issue-#${{ github.event.issue.number }}] ${{ github.event.issue.title }}'
+          description: '${{ steps.description.outputs.content }}'
+
+      - name: Add Jira Link Comment
+        if: steps.check-jira.outputs.result == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const jiraKey = '${{ steps.create-jira.outputs.issue }}';
+            const jiraUrl = '${{ secrets.JIRA_BASE_URL }}/browse/' + jiraKey;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `Jira: [${jiraKey}](${jiraUrl})`
+            });
+
+  # Issue 수정 시 Jira 업데이트
+  update-jira-on-edit:
+    if: github.event_name == 'issues' && github.event.action == 'edited'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Jira Key from Comments
+        id: get-jira-key
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number
+            });
+            
+            for (const comment of comments.data) {
+              const match = comment.body.match(/Jira: \[([A-Z]+-\d+)\]/);
+              if (match) {
+                core.setOutput('jira_key', match[1]);
+                return match[1];
+              }
+            }
+            core.setOutput('jira_key', '');
+            return '';
+
+      - name: Parse Updated Issue
+        if: steps.get-jira-key.outputs.jira_key != ''
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const labels = issue.labels.map(l => l.name);
+            const title = issue.title;
+            const body = issue.body || '';
+            
+            const parseSection = (label) => {
+              const regex = new RegExp(`### ${label}\\s*\\n([\\s\\S]*?)(?=###|$)`);
+              const match = body.match(regex);
+              return match ? match[1].trim() : '-';
+            };
+            
+            let templateType = 'task';
+            if (labels.includes('epic') || /^\[EPIC\]/i.test(title)) templateType = 'epic';
+            else if (labels.includes('story') || /^\[STORY\]/i.test(title)) templateType = 'story';
+            else if (labels.includes('change-request') || /^\[CR\]/i.test(title)) templateType = 'cr';
+            else if (labels.includes('spike') || /^\[SPIKE\]/i.test(title)) templateType = 'spike';
+            
+            const descContent = [
+              { type: 'paragraph', content: [{ type: 'text', text: `GitHub Issue: ${issue.html_url}` }] },
+              { type: 'paragraph', content: [{ type: 'text', text: `Author: ${issue.user.login}` }] },
+              { type: 'paragraph', content: [{ type: 'text', text: `Last Updated: ${new Date().toISOString()}` }] }
+            ];
+            
+            switch (templateType) {
+              case 'epic':
+                descContent.push(
+                  { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '목표' }] },
+                  { type: 'paragraph', content: [{ type: 'text', text: parseSection('목표') }] },
+                  { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '범위' }] },
+                  { type: 'paragraph', content: [{ type: 'text', text: parseSection('범위 / Not-in-scope') }] }
+                );
+                break;
+              case 'story':
+                descContent.push(
+                  { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '배경' }] },
+                  { type: 'paragraph', content: [{ type: 'text', text: parseSection('배경') }] },
+                  { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '수용 기준(AC)' }] },
+                  { type: 'paragraph', content: [{ type: 'text', text: parseSection('수용 기준\\(AC\\)') }] }
+                );
+                break;
+              case 'cr':
+                descContent.push(
+                  { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '제안 변경 사항' }] },
+                  { type: 'paragraph', content: [{ type: 'text', text: parseSection('제안 변경 사항') }] },
+                  { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '영향도' }] },
+                  { type: 'paragraph', content: [{ type: 'text', text: parseSection('영향도') }] }
+                );
+                break;
+              case 'spike':
+                descContent.push(
+                  { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '타임박스' }] },
+                  { type: 'paragraph', content: [{ type: 'text', text: parseSection('타임박스') }] },
+                  { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '핵심 질문' }] },
+                  { type: 'paragraph', content: [{ type: 'text', text: parseSection('핵심 질문') }] }
+                );
+                break;
+              default:
+                descContent.push(
+                  { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '연결된 Story/Epic' }] },
+                  { type: 'paragraph', content: [{ type: 'text', text: parseSection('연결된 Story/Epic') }] },
+                  { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '작업 범위' }] },
+                  { type: 'paragraph', content: [{ type: 'text', text: parseSection('작업 범위') }] }
+                );
+            }
+            
+            core.setOutput('description', JSON.stringify(descContent));
+
+      - name: Update Jira Issue
+        if: steps.get-jira-key.outputs.jira_key != ''
+        uses: actions/github-script@v7
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+          DESC_JSON: ${{ steps.parse.outputs.description }}
+        with:
+          script: |
+            const jiraKey = '${{ steps.get-jira-key.outputs.jira_key }}';
+            const issue = context.payload.issue;
+            const descContent = JSON.parse(process.env.DESC_JSON);
+            
+            const response = await fetch(
+              `${process.env.JIRA_BASE_URL}/rest/api/3/issue/${jiraKey}`,
+              {
+                method: 'PUT',
+                headers: {
+                  'Authorization': `Basic ${Buffer.from(`${process.env.JIRA_USER_EMAIL}:${process.env.JIRA_API_TOKEN}`).toString('base64')}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  fields: {
+                    summary: `[Issue-#${issue.number}] ${issue.title}`,
+                    description: {
+                      type: 'doc',
+                      version: 1,
+                      content: descContent
+                    }
+                  }
+                })
+              }
+            );
+            
+            if (response.ok) {
+              console.log(`✓ Updated Jira ${jiraKey}`);
+            } else {
+              const error = await response.text();
+              console.log(`✗ Failed to update Jira ${jiraKey}: ${error}`);
+            }
+
+  # Issue 닫기 시 Jira 상태 변경
+  close-jira-on-issue-close:
+    if: github.event_name == 'issues' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Jira Key from Comments
+        id: get-jira-key
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number
+            });
+            
+            for (const comment of comments.data) {
+              const match = comment.body.match(/Jira: \[([A-Z]+-\d+)\]/);
+              if (match) {
+                core.setOutput('jira_key', match[1]);
+                return match[1];
+              }
+            }
+            core.setOutput('jira_key', '');
+            return '';
+
+      - name: Get Jira Transitions
+        if: steps.get-jira-key.outputs.jira_key != ''
+        id: get-transitions
+        uses: actions/github-script@v7
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+        with:
+          script: |
+            const jiraKey = '${{ steps.get-jira-key.outputs.jira_key }}';
+            
+            const response = await fetch(
+              `${process.env.JIRA_BASE_URL}/rest/api/3/issue/${jiraKey}/transitions`,
+              {
+                headers: {
+                  'Authorization': `Basic ${Buffer.from(`${process.env.JIRA_USER_EMAIL}:${process.env.JIRA_API_TOKEN}`).toString('base64')}`,
+                  'Content-Type': 'application/json'
+                }
+              }
+            );
+            
+            const data = await response.json();
+            console.log('Available transitions:', JSON.stringify(data.transitions, null, 2));
+            
+            // "Done", "완료", "Closed" 등의 transition 찾기
+            const doneTransition = data.transitions.find(t => 
+              /done|완료|closed?|complete/i.test(t.name)
+            );
+            
+            if (doneTransition) {
+              core.setOutput('transition_id', doneTransition.id);
+              console.log(`Found transition: ${doneTransition.name} (${doneTransition.id})`);
+            } else {
+              core.setOutput('transition_id', '');
+              console.log('No matching transition found');
+            }
+
+      - name: Transition Jira to Done
+        if: steps.get-jira-key.outputs.jira_key != '' && steps.get-transitions.outputs.transition_id != ''
+        uses: actions/github-script@v7
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+        with:
+          script: |
+            const jiraKey = '${{ steps.get-jira-key.outputs.jira_key }}';
+            const transitionId = '${{ steps.get-transitions.outputs.transition_id }}';
+            
+            const response = await fetch(
+              `${process.env.JIRA_BASE_URL}/rest/api/3/issue/${jiraKey}/transitions`,
+              {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Basic ${Buffer.from(`${process.env.JIRA_USER_EMAIL}:${process.env.JIRA_API_TOKEN}`).toString('base64')}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  transition: { id: transitionId }
+                })
+              }
+            );
+            
+            if (response.ok) {
+              console.log(`✓ Transitioned Jira ${jiraKey} to Done`);
+            } else {
+              const error = await response.text();
+              console.log(`✗ Failed to transition Jira ${jiraKey}: ${error}`);
+            }
+
+      - name: Add Close Comment to Jira
+        if: steps.get-jira-key.outputs.jira_key != ''
+        uses: actions/github-script@v7
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+        with:
+          script: |
+            const jiraKey = '${{ steps.get-jira-key.outputs.jira_key }}';
+            const issue = context.payload.issue;
+            
+            await fetch(
+              `${process.env.JIRA_BASE_URL}/rest/api/3/issue/${jiraKey}/comment`,
+              {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Basic ${Buffer.from(`${process.env.JIRA_USER_EMAIL}:${process.env.JIRA_API_TOKEN}`).toString('base64')}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  body: {
+                    type: 'doc',
+                    version: 1,
+                    content: [
+                      {
+                        type: 'paragraph',
+                        content: [
+                          { type: 'text', text: `GitHub Issue closed by ${issue.user.login} at ${new Date().toISOString()}` }
+                        ]
+                      }
+                    ]
+                  }
+                })
+              }
+            );
+
+  # 기존 이슈 일괄 처리
+  sync-all-open-issues:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Process All Open Issues
+        uses: actions/github-script@v7
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+        with:
+          script: |
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+            
+            const realIssues = issues.data.filter(issue => !issue.pull_request);
+            console.log(`Found ${realIssues.length} open issues`);
+            
+            for (const issue of realIssues) {
+              const comments = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number
+              });
+            
+              const hasJiraLink = comments.data.some(c => c.body.includes('Jira:'));
+              if (hasJiraLink) {
+                console.log(`Issue #${issue.number} already has Jira link, skipping`);
+                continue;
+              }
+            
+              console.log(`Processing Issue #${issue.number}: ${issue.title}`);
+            
+              const labels = issue.labels.map(l => l.name);
+              const title = issue.title;
+              const body = issue.body || '';
+            
+              // Jira Type 결정
+              let jiraType = 'Task';
+              if (labels.includes('epic') || /^\[EPIC\]/i.test(title)) jiraType = 'Epic';
+              else if (labels.includes('story') || /^\[STORY\]/i.test(title)) jiraType = 'Story';
+              else if (labels.includes('bug') || /^\[BUG\]/i.test(title)) jiraType = 'Bug';
+            
+              // 템플릿 타입 판단
+              let templateType = 'task';
+              if (labels.includes('epic') || /^\[EPIC\]/i.test(title)) templateType = 'epic';
+              else if (labels.includes('story') || /^\[STORY\]/i.test(title)) templateType = 'story';
+              else if (labels.includes('change-request') || /^\[CR\]/i.test(title)) templateType = 'cr';
+              else if (labels.includes('spike') || /^\[SPIKE\]/i.test(title)) templateType = 'spike';
+            
+              // 섹션 파싱
+              const parseSection = (label) => {
+                const regex = new RegExp(`### ${label}\\s*\\n([\\s\\S]*?)(?=###|$)`);
+                const match = body.match(regex);
+                return match ? match[1].trim() : '-';
+              };
+            
+              // description 구성
+              const descContent = [
+                { type: 'paragraph', content: [{ type: 'text', text: `GitHub Issue: ${issue.html_url}` }] },
+                { type: 'paragraph', content: [{ type: 'text', text: `Author: ${issue.user.login}` }] }
+              ];
+            
+              switch (templateType) {
+                case 'epic':
+                  descContent.push(
+                    { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '목표' }] },
+                    { type: 'paragraph', content: [{ type: 'text', text: parseSection('목표') }] },
+                    { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '범위' }] },
+                    { type: 'paragraph', content: [{ type: 'text', text: parseSection('범위 / Not-in-scope') }] }
+                  );
+                  break;
+                case 'story':
+                  descContent.push(
+                    { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '배경' }] },
+                    { type: 'paragraph', content: [{ type: 'text', text: parseSection('배경') }] },
+                    { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '수용 기준(AC)' }] },
+                    { type: 'paragraph', content: [{ type: 'text', text: parseSection('수용 기준\\(AC\\)') }] }
+                  );
+                  break;
+                case 'cr':
+                  descContent.push(
+                    { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '제안 변경 사항' }] },
+                    { type: 'paragraph', content: [{ type: 'text', text: parseSection('제안 변경 사항') }] },
+                    { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '영향도' }] },
+                    { type: 'paragraph', content: [{ type: 'text', text: parseSection('영향도') }] }
+                  );
+                  break;
+                case 'spike':
+                  descContent.push(
+                    { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '타임박스' }] },
+                    { type: 'paragraph', content: [{ type: 'text', text: parseSection('타임박스') }] },
+                    { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '핵심 질문' }] },
+                    { type: 'paragraph', content: [{ type: 'text', text: parseSection('핵심 질문') }] }
+                  );
+                  break;
+                default:
+                  descContent.push(
+                    { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '연결된 Story/Epic' }] },
+                    { type: 'paragraph', content: [{ type: 'text', text: parseSection('연결된 Story/Epic') }] },
+                    { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: '작업 범위' }] },
+                    { type: 'paragraph', content: [{ type: 'text', text: parseSection('작업 범위') }] }
+                  );
+              }
+            
+              const jiraResponse = await fetch(
+                `${process.env.JIRA_BASE_URL}/rest/api/3/issue`,
+                {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `Basic ${Buffer.from(`${process.env.JIRA_USER_EMAIL}:${process.env.JIRA_API_TOKEN}`).toString('base64')}`,
+                    'Content-Type': 'application/json'
+                  },
+                  body: JSON.stringify({
+                    fields: {
+                      project: { key: 'MESP' },
+                      summary: `[Issue-#${issue.number}] ${issue.title}`,
+                      description: {
+                        type: 'doc',
+                        version: 1,
+                        content: descContent
+                      },
+                      issuetype: { name: jiraType }
+                    }
+                  })
+                }
+              );
+            
+              const jiraData = await jiraResponse.json();
+            
+              if (jiraData.key) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: `Jira: [${jiraData.key}](${process.env.JIRA_BASE_URL}/browse/${jiraData.key})`
+                });
+                console.log(`Created Jira ${jiraData.key} for Issue #${issue.number}`);
+              } else {
+                console.log(`Failed to create Jira for Issue #${issue.number}:`, jiraData);
+              }
+            
+              await new Promise(resolve => setTimeout(resolve, 1000));
+            }
